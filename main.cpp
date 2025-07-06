@@ -1,33 +1,31 @@
-#include <iostream>
-#include <string>
-#include <map>
-#include <set>
-#include <deque>
-#include <thread>
-#include <mutex>
-#include <sstream>
+#include <atomic>
 #include <csignal>
 #include <cstring>
-#include <cstdlib>
-#include <unistd.h>
-#include <algorithm>
-#include <sys/socket.h>
+#include <deque>
+#include <exception>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <netinet/in.h>
 #include <poll.h>
-#include <errno.h>
+#include <set>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unistd.h>
 #include <vector>
-#include <atomic>
+#include <algorithm>
 
 using namespace std;
 
-static const int MAX_MESSAGE_LEN = 256;
-static const int MAX_MESSAGES = 40;
-static const int SEND_TIMEOUT_MS = 1000; // Таймаут для safe_send
+#define MAX_COMMAND_LEN 1024
+
 
 struct Message {
     string nick;
     string text;
-    Message(const string& n = "", const string& t = "") : nick(n), text(t) {}
+    Message(const string& n, const string& t) : nick(n), text(t) {}
 };
 
 struct Channel {
@@ -36,25 +34,20 @@ struct Channel {
     mutex mtx;
 };
 
-static map<string, Channel> channels;
-static mutex global_mtx;
 static int server_fd = -1;
-static atomic<bool> running(true);
+static atomic<bool> stopFlag{false};
 
-// Для отслеживания активных клиентов
-static mutex clients_mtx;
-static set<int> client_fds;
+map<string, shared_ptr<Channel>> channels;
+mutex channels_mutex;
 
-// Тримминг строки (обрезка пробелов)
-static inline string trim(const string &s) {
-    auto wsfront = find_if_not(s.begin(), s.end(), [](int c){ return isspace(c); });
-    auto wsback = find_if_not(s.rbegin(), s.rend(), [](int c){ return isspace(c); }).base();
-    if (wsfront >= wsback) return "";
-    return string(wsfront, wsback);
-}
+vector<thread> threads;
+mutex threads_mutex;
 
-// Безопасная отправка с таймаутом, возвращает false при ошибке
-bool safe_send(int sockfd, const string& message, int timeout_ms = SEND_TIMEOUT_MS) {
+set<int> client_sockets;
+mutex client_sockets_mutex;
+
+
+bool safe_send(int sockfd, const string& message, int timeout_ms = 30000) {
     const char* data = message.c_str();
     size_t total_sent = 0;
     size_t to_send = message.size();
@@ -62,216 +55,286 @@ bool safe_send(int sockfd, const string& message, int timeout_ms = SEND_TIMEOUT_
     while (total_sent < to_send) {
         pollfd pfd{sockfd, POLLOUT, 0};
         int res = poll(&pfd, 1, timeout_ms);
-        if (res < 0) {
-            if (errno == EINTR) continue;
-            perror("poll");
-            return false;
-        }
-        if (res == 0) {
-            cerr << "safe_send: timeout\n";
+        if (res <= 0) {
+            if (res == 0) cerr << "safe_send: timeout" << endl;
+            else perror("poll");
             return false;
         }
 
         ssize_t sent = send(sockfd, data + total_sent, to_send - total_sent, MSG_NOSIGNAL);
         if (sent < 0) {
             if (errno == EINTR) continue;
-            if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN) {
-                cerr << "safe_send: connection closed: " << strerror(errno) << "\n";
+
+            if (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN ||
+                errno == ETIMEDOUT || errno == EHOSTUNREACH) {
+                cerr << "safe_send: соединение разорвано: " << strerror(errno) << endl;
             } else {
                 perror("send");
             }
+
             return false;
         }
+
         if (sent == 0) {
-            cerr << "safe_send: connection closed by peer\n";
+            cerr << "safe_send: соединение закрыто" << endl;
             return false;
         }
+
         total_sent += sent;
     }
+
     return true;
 }
 
-// Обработчик клиента в отдельном потоке
-void handle_client(int client_fd) {
-    {
-        lock_guard<mutex> lock(clients_mtx);
-        client_fds.insert(client_fd);
+bool recvLine(int sock, std::string &out, int timeout_ms = 30000) {
+    out.clear();
+    char c;
+
+    while (out.size() < MAX_COMMAND_LEN) {
+        pollfd pfd{sock, POLLIN, 0};
+        int res = poll(&pfd, 1, timeout_ms);
+        if (res <= 0) {
+            if (res == 0) std::cerr << "recvLine: timeout\n";
+            else perror("poll");
+            return false;
+        }
+
+        ssize_t r = recv(sock, &c, 1, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            perror("recv");
+            return false;
+        }
+        if (r == 0) {
+            std::cerr << "recvLine: соединение закрыто\n";
+            return false;
+        }
+
+        if (c == '\n') break;
+        if (c != '\r') out.push_back(c);
     }
 
-    char buffer[1024];
-    while (running) {
-        memset(buffer, 0, sizeof(buffer));
-        ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-        if (bytes_read <= 0) break;
+    if (out.size() >= MAX_COMMAND_LEN) {
+        std::cerr << "recvLine: превышена максимальная длина строки\n";
+        return false;
+    }
 
-        string cmd(buffer);
-        cmd.erase(cmd.find_last_not_of(" \r\n") + 1);
+    return true;
+}
+
+static inline string trim(const string &s) {
+    auto wsfront = find_if_not(s.begin(), s.end(), [](int c){ return isspace(c); });
+    auto wsback  = find_if_not(s.rbegin(), s.rend(), [](int c){ return isspace(c); }).base();
+    return (wsback <= wsfront ? string() : string(wsfront, wsback));
+}
+
+void handle_client(int client_fd) {
+    string line;
+    while (!stopFlag && recvLine(client_fd, line)) {
+        string cmd = trim(line);
+        if (cmd.empty()) continue;
+        
         istringstream iss(cmd);
-        string action, channel, nick;
-        iss >> action >> channel >> nick;
-
-        if (action.empty() || channel.empty() || nick.empty()) {
-            if (!safe_send(client_fd, "ERROR: invalid command\n")) break;
+        string action, channel_name, nick;
+        iss >> action >> channel_name >> nick;
+        if (action.empty() || channel_name.empty() || nick.empty()) {
+            safe_send(client_fd, "ERROR: invalid command\n");
             continue;
         }
-        if (channel.length() > 24 || nick.length() > 24) {
-            if (!safe_send(client_fd, "ERROR: channel or nick too long\n")) break;
+        if (channel_name.size() > 24 || nick.size() > 24) {
+            safe_send(client_fd, "ERROR: channel or nick too long\n");
             continue;
         }
 
-        Channel *ch_ptr = nullptr;
-        bool abort = false;
+        shared_ptr<Channel> ch_ptr;
         {
-            lock_guard<mutex> lock(global_mtx);
-            auto it = channels.find(channel);
+            lock_guard<mutex> lock(channels_mutex);
+            auto it = channels.find(channel_name);
             if (it == channels.end()) {
                 if (action == "send" || action == "join") {
-                    auto res = channels.try_emplace(channel);
-                    it = res.first;
+                    ch_ptr = make_shared<Channel>();
+                    channels[channel_name] = ch_ptr;
                 } else {
-                    if (!safe_send(client_fd, "ERROR: not in channel\n")) abort = true;
-                    if (abort) break;
+                    safe_send(client_fd, "ERROR: no such channel\n");
                     continue;
                 }
-            }
-            ch_ptr = &it->second;
-        }
-
-        Channel &ch = *ch_ptr;
-        
-        if (action == "join") {
-            lock_guard<mutex> ch_lock(ch.mtx);
-            if (ch.members.count(nick)) {
-                if (!safe_send(client_fd, "ERROR: already in channel\n")) break;
             } else {
-                ch.members.insert(nick);
-                if (!safe_send(client_fd, "OK\n")) break;
+                ch_ptr = it->second;
+            }
+        }
+        Channel &ch = *ch_ptr;
+
+        if (action == "join") {
+            lock_guard<mutex> lk(ch.mtx);
+            if (!ch.members.insert(nick).second) {
+                safe_send(client_fd, "ERROR: user already in channel\n");
+            } else {
+                safe_send(client_fd, "OK\n");
             }
         }
         else if (action == "exit") {
-            lock_guard<mutex> ch_lock(ch.mtx);
-            if (!ch.members.count(nick)) {
-                if (!safe_send(client_fd, "ERROR: not in channel\n")) break;
+            lock_guard<mutex> lk(ch.mtx);
+            if (!ch.members.erase(nick)) {
+                safe_send(client_fd, "ERROR: not in channel\n");
             } else {
-                ch.members.erase(nick);
-                if (!safe_send(client_fd, "OK\n")) break;
+                safe_send(client_fd, "OK\n");
             }
         }
         else if (action == "send") {
-            lock_guard<mutex> ch_lock(ch.mtx);
             string message;
             getline(iss, message);
             message = trim(message);
             if (message.empty()) {
-                if (!safe_send(client_fd, "ERROR: message cannot be empty\n")) break;
+                safe_send(client_fd, "ERROR: message cannot be empty\n");
                 continue;
             }
+            if (message.size() > 256) {
+                message.resize(256);
+            }
+            lock_guard<mutex> lk(ch.mtx);
             if (!ch.members.count(nick)) {
-                if (!safe_send(client_fd, "ERROR: not in channel\n")) break;
+                safe_send(client_fd, "ERROR: not in channel\n");
             } else {
-                if (message.size() > MAX_MESSAGE_LEN) message.resize(MAX_MESSAGE_LEN);
                 ch.messages.emplace_back(nick, message);
-                if (ch.messages.size() > MAX_MESSAGES) ch.messages.pop_front();
-                if (!safe_send(client_fd, "OK\n")) break;
+                if (ch.messages.size() > 40) {
+                    ch.messages.pop_front();
+                }
+                safe_send(client_fd, "OK\n");
             }
         }
         else if (action == "read") {
-            // Режим чтения: копируем буфер под мьютексом, затем отправляем
-            deque<Message> copy_msgs;
-            size_t count = 0;
+            vector<string> outbuf;
             {
-                lock_guard<mutex> ch_lock(ch.mtx);
+                lock_guard<mutex> lk(ch.mtx);
                 if (!ch.members.count(nick)) {
-                    if (!safe_send(client_fd, "ERROR: not in channel\n")) break;
-                    goto CONTINUE_LOOP;
+                    safe_send(client_fd, "ERROR: not in channel\n");
+                    continue;
                 }
-                copy_msgs = ch.messages;
-                count = copy_msgs.size();
+                outbuf.reserve(ch.messages.size() + 1); // для OK N\n
+                outbuf.push_back("OK " + to_string(ch.messages.size()) + "\n");
+                for (auto &msg : ch.messages) {
+                    outbuf.push_back(msg.nick + ": " + msg.text + "\n");
+                }
             }
-            if (!safe_send(client_fd, string("OK ") + to_string(count) + "\n")) break;
-            for (const auto& msg : copy_msgs) {
-                string line = msg.nick + ": " + msg.text + "\n";
-                if (!safe_send(client_fd, line)) break;
+            for (auto &i : outbuf) {
+                if (!safe_send(client_fd, i)) break;
             }
         }
         else {
-CONTINUE_LOOP:;
-            if (action != "read") {
-                if (!safe_send(client_fd, "ERROR: unknown command\n")) break;
-            }
+            safe_send(client_fd, "ERROR: unknown command\n");
         }
-
     }
-
     close(client_fd);
-    {
-        lock_guard<mutex> lock(clients_mtx);
-        client_fds.erase(client_fd);
-    }
 }
 
-// SIGINT: устанавливаем флаг остановки и закрываем слушающий сокет
-void signal_handler(int) {
+
+void shutdown_server() {
+    stopFlag = true;
+    
+    {
+        lock_guard<mutex> lock(client_sockets_mutex);
+        for (int fd : client_sockets) {
+            shutdown(fd, SHUT_RDWR);
+        }
+    }
+    
     if (server_fd != -1) {
+        shutdown(server_fd, SHUT_RDWR);
         close(server_fd);
         server_fd = -1;
     }
-    running = false;
+}
+
+void signal_handler(int signum) {
+    if (signum == SIGINT) {
+        shutdown_server();
+    }
 }
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
-        cerr << "Usage: ./server <port>\n";
-        return EXIT_FAILURE;
+        cerr << "Usage: " << argv[0] << " <port>\n";
+        return 1;
+    }
+
+    int port;
+    try {
+        port = stoi(argv[1]);
+    } catch (exception &) {
+        cerr << "ERROR: invalid port\n";
+        return 1;
     }
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, nullptr);
-
-    int port;
-    try { port = stoi(argv[1]); } catch (...) { cerr << "Invalid port\n"; return EXIT_FAILURE; }
-    if (port <= 0 || port > 65535) { cerr << "Port out of range\n"; return EXIT_FAILURE; }
+    if (sigaction(SIGINT, &sa, nullptr) < 0) {
+        perror("sigaction");
+        return 1;
+    }
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) { perror("socket"); return EXIT_FAILURE; }
+    if (server_fd < 0) { perror("socket"); return 1; }
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+    if (bind(server_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        return 1;
+    }
+    if (listen(server_fd, 10) < 0) {
+        perror("listen");
+        return 1;
+    }
+    cout << "Server listening on port " << port << endl;
 
-    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) { perror("bind"); close(server_fd); return EXIT_FAILURE; }
-    if (listen(server_fd, 10) < 0) { perror("listen"); close(server_fd); return EXIT_FAILURE; }
-
-    cout << "Server is listening on port " << port << "\n";
-
-    vector<thread> threads;
-    while (running) {
-        sockaddr_in client_addr{};
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+    while (!stopFlag) {
+        sockaddr_in client_addr;
+        socklen_t len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (sockaddr*)&client_addr, &len);
         if (client_fd < 0) {
-            if (!running) break;
-            if (errno == EINTR) continue;
+            if (stopFlag || errno == EINTR) break;
             perror("accept");
             continue;
         }
-        threads.emplace_back(handle_client, client_fd);
+        
+        {
+            lock_guard<mutex> lock(client_sockets_mutex);
+            client_sockets.insert(client_fd);
+        }
+        
+        {
+            lock_guard<mutex> lock(threads_mutex);
+            threads.erase(
+                remove_if(threads.begin(), threads.end(), 
+                    [](thread& t) { return !t.joinable(); }),
+                threads.end()
+            );
+            
+            threads.emplace_back([client_fd]() {
+                handle_client(client_fd);
+                {
+                    lock_guard<mutex> lock(client_sockets_mutex);
+                    client_sockets.erase(client_fd);
+                }
+                close(client_fd);
+            });
+        }
     }
 
-    if (server_fd != -1) close(server_fd);
     {
-        lock_guard<mutex> lock(clients_mtx);
-        for (int fd : client_fds) shutdown(fd, SHUT_RDWR);
+        lock_guard<mutex> lock(threads_mutex);
+        for (auto &t : threads) {
+            if (t.joinable()) t.join();
+        }
     }
-    for (auto &t : threads) if (t.joinable()) t.join();
 
     cout << "Server shutdown complete.\n";
-    return EXIT_SUCCESS;
+    return 0;
 }
-
