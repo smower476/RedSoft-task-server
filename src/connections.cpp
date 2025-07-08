@@ -88,23 +88,11 @@ bool recvLine(int sock, std::string& out, int timeout_ms) {
 
 void shutdown_server() {
     stopFlag = true;
-
-    {
-        std::lock_guard<std::mutex> lock(client_sockets_mutex);
-        for (int fd : client_sockets) {
-            shutdown(fd, SHUT_RDWR);
-            close(fd);
-        }
-        client_sockets.clear();
-    }
-
+    
     if (server_fd != -1) {
         shutdown(server_fd, SHUT_RDWR);
-        close(server_fd);
-        server_fd = -1;
     }
 }
-
 void signal_handler(int signum) {
     if (signum == SIGINT) {
         shutdown_server();

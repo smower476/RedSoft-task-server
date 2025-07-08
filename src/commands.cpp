@@ -9,7 +9,6 @@
 #include <vector>
 #include <unistd.h>
 
-
 struct Message {
     std::string nick;
     std::string text;
@@ -58,7 +57,7 @@ static void handleSend(int client_fd, Channel& ch, const std::string& nick, cons
     
     if (truncated.empty()) {
         response = "ERROR: message cannot be empty\n";
-        // safe_send(client_fd, "ERROR: message cannot be empty\n");
+        safe_send(client_fd, "ERROR: message cannot be empty\n");
         return;
     }
 
@@ -90,12 +89,15 @@ static void handleRead(int client_fd, Channel& ch, const std::string& nick) {
         if (!ch.members.count(nick)) {
             response = "ERROR: not in channel\n";
             //safe_send(client_fd, "ERROR: not in channel\n");
-            return;
+            //return;
         }
         snapshot.assign(ch.messages.begin(), ch.messages.end());
     }
     
-    if (!response.empty()) safe_send(client_fd, response);
+    if (!response.empty()) {
+        safe_send(client_fd, response);
+        return;
+    }
 
     {
         std::string header = "OK " + std::to_string(snapshot.size()) + "\n";

@@ -52,10 +52,12 @@ int main(int argc, char* argv[]) {
     addr.sin_port = htons(port);
     if (bind(server_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind");
+        close(server_fd);
         return 1;
     }
     if (listen(server_fd, 10) < 0) {
         perror("listen");
+        close(server_fd);
         return 1;
     }
     std::cout << "Server listening on port " << port << std::endl;
@@ -88,11 +90,31 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (server_fd != -1) {
+        close(server_fd);
+        server_fd = -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(client_sockets_mutex);
+        for (int fd : client_sockets) {
+            shutdown(fd, SHUT_RDWR); 
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(threads_mutex);
         for (auto& t : threads) {
             if (t.joinable()) t.join();
         }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(client_sockets_mutex);
+        for (int fd : client_sockets) {
+            close(fd);
+        }
+        client_sockets.clear();
     }
 
     std::cout << "Server shutdown complete.\n";
