@@ -26,65 +26,89 @@ std::mutex channels_mutex;
 std::map<std::string, std::shared_ptr<Channel>> channels;
 
 static void handleJoin(int client_fd, Channel& ch, const std::string& nick) {
-    std::lock_guard<std::mutex> lk(ch.mtx);
-    if (!ch.members.insert(nick).second) {
-        safe_send(client_fd, "ERROR: user already in channel\n");
-    } else {
-        safe_send(client_fd, "OK\n");
+    std::string response;
+    {
+        std::lock_guard<std::mutex> lk(ch.mtx);
+        if (!ch.members.insert(nick).second) {
+            response = "ERROR: user already in channel\n";
+        } else {
+            response = "OK\n";
+        }
     }
+    safe_send(client_fd, response);
 }
 
 static void handleExit(int client_fd, Channel& ch, const std::string& nick) {
-    std::lock_guard<std::mutex> lk(ch.mtx);
-    if (!ch.members.erase(nick)) {
-        safe_send(client_fd, "ERROR: not in channel\n");
-    } else {
-        safe_send(client_fd, "OK\n");
+    std::string response;
+    {
+        std::lock_guard<std::mutex> lk(ch.mtx);
+        if (!ch.members.erase(nick)) {
+            response = "ERROR: not in channel\n";
+        } else {
+            response = "OK\n"; 
+        }
     }
+    safe_send(client_fd, response);
+
 }
 
 static void handleSend(int client_fd, Channel& ch, const std::string& nick, const std::string& message) {
-    if (message.empty()) {
-        safe_send(client_fd, "ERROR: message cannot be empty\n");
+    std::string truncated = message;
+    std::string response;
+    
+    if (truncated.empty()) {
+        response = "ERROR: message cannot be empty\n";
+        // safe_send(client_fd, "ERROR: message cannot be empty\n");
         return;
     }
-    
-    std::string truncated = message;
+
     if (truncated.size() > 256) {
         truncated.resize(256);
     }
-    
-    std::lock_guard<std::mutex> lk(ch.mtx);
-    if (!ch.members.count(nick)) {
-        safe_send(client_fd, "ERROR: not in channel\n");
-    } else {
-        ch.messages.emplace_back(nick, truncated);
-        if (ch.messages.size() > 40) {
-            ch.messages.pop_front();
-        }
-        safe_send(client_fd, "OK\n");
-    }
-}
 
-static void handleRead(int client_fd, Channel& ch, const std::string& nick) {
-    std::vector<std::string> outbuf;
-    
     {
         std::lock_guard<std::mutex> lk(ch.mtx);
         if (!ch.members.count(nick)) {
-            safe_send(client_fd, "ERROR: not in channel\n");
-            return;
-        }
-        
-        outbuf.reserve(ch.messages.size() + 1);
-        outbuf.push_back("OK " + std::to_string(ch.messages.size()) + "\n");
-        for (auto& msg : ch.messages) {
-            outbuf.push_back(msg.nick + ": " + msg.text + "\n");
+            response = "ERROR: not in channel\n";
+        } else {
+            ch.messages.emplace_back(nick, truncated);
+            if (ch.messages.size() > 40) {
+                ch.messages.pop_front();
+            }
+            response = "OK\n";
         }
     }
+    safe_send(client_fd, response);
+}
+
+
+static void handleRead(int client_fd, Channel& ch, const std::string& nick) {
+    std::vector<Message> snapshot;
+    std::string response;
+    {
+        std::lock_guard<std::mutex> lk(ch.mtx);
+        if (!ch.members.count(nick)) {
+            response = "ERROR: not in channel\n";
+            //safe_send(client_fd, "ERROR: not in channel\n");
+            return;
+        }
+        snapshot.assign(ch.messages.begin(), ch.messages.end());
+    }
     
-    for (auto& line : outbuf) {
-        if (!safe_send(client_fd, line)) break;
+    if (!response.empty()) safe_send(client_fd, response);
+
+    {
+        std::string header = "OK " + std::to_string(snapshot.size()) + "\n";
+        if (!safe_send(client_fd, header)) {
+            return; 
+        }
+    }
+
+    for (const auto& msg : snapshot) {
+        std::string line = msg.nick + ": " + msg.text + "\n";
+        if (!safe_send(client_fd, line)) {
+            break; 
+        }
     }
 }
 
@@ -110,7 +134,7 @@ void handle_client(int client_fd) {
         std::shared_ptr<Channel> ch_ptr;
         {
             std::lock_guard<std::mutex> lock(channels_mutex);
-            auto it = channels.find(channel_name);
+            auto it = channels.find(channel_name); 
             
             if (it == channels.end()) {
                 if (action == "send" || action == "join") {
@@ -124,7 +148,7 @@ void handle_client(int client_fd) {
                 ch_ptr = it->second;
             }
         }
-        Channel& ch = *ch_ptr;
+        Channel &ch = *ch_ptr;
 
         if (action == "join") {
             handleJoin(client_fd, ch, nick);
